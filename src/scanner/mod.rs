@@ -1,13 +1,12 @@
 //! Core functionality for actual scanning behaviour.
 use crate::port_strategy::PortStrategy;
 use log::debug;
-
+use tokio::io;
+use tokio::net::TcpStream;
 mod socket_iterator;
 use socket_iterator::SocketIterator;
 
-use async_std::io;
-use async_std::net::TcpStream;
-use async_std::prelude::*;
+
 use colored::Colorize;
 use futures::stream::FuturesUnordered;
 use std::{
@@ -16,7 +15,8 @@ use std::{
     num::NonZeroU8,
     time::Duration,
 };
-
+use tokio::io::AsyncWriteExt;
+use tokio::task::JoinSet;
 /// The class for the scanner
 /// IP is data type IpAddr and is the IP address
 /// start & end is where the port scan starts and ends
@@ -28,6 +28,7 @@ use std::{
 #[cfg(not(tarpaulin_include))]
 #[derive(Debug)]
 pub struct Scanner {
+
     ips: Vec<IpAddr>,
     batch_size: u16,
     timeout: Duration,
@@ -67,7 +68,7 @@ impl Scanner {
     /// If you want to run RustScan normally, this is the entry point used
     /// Returns all open ports as `Vec<u16>`
     /// Added by wasuaje - 01/26/2024:
-    ///    Filtering port against exclude port list
+    ///Filtering port against exclude port list
     pub async fn run(&self) -> Vec<SocketAddr> {
         let ports: Vec<u16> = self
             .port_strategy
@@ -78,12 +79,12 @@ impl Scanner {
             .collect();
         let mut socket_iterator: SocketIterator = SocketIterator::new(&self.ips, &ports);
         let mut open_sockets: Vec<SocketAddr> = Vec::new();
-        let mut ftrs = FuturesUnordered::new();
+        let mut ftrs = JoinSet::new();
         let mut errors: HashSet<String> = HashSet::new();
 
         for _ in 0..self.batch_size {
             if let Some(socket) = socket_iterator.next() {
-                ftrs.push(self.scan_socket(socket));
+                ftrs.spawn(self.clone().scan_socket(socket));
             } else {
                 break;
             }
@@ -95,18 +96,19 @@ impl Scanner {
             &ports.len(),
             (self.ips.len() * ports.len()));
 
-        while let Some(result) = ftrs.next().await {
+        while let Some(result) = ftrs.join_next().await {
             if let Some(socket) = socket_iterator.next() {
-                ftrs.push(self.scan_socket(socket));
+                ftrs.spawn(self.clone().scan_socket(socket));
             }
 
-            match result {
-                Ok(socket) => open_sockets.push(socket),
-                Err(e) => {
+            match result.map_err(io::Error::from) {
+                Ok(Ok(socket)) => open_sockets.push(socket),
+                Err(e) | Ok(Err(e)) => {
                     let error_string = e.to_string();
                     if errors.len() < self.ips.len() * 1000 {
                         errors.insert(error_string);
                     }
+                
                 }
             }
         }
@@ -114,6 +116,7 @@ impl Scanner {
         debug!("Open Sockets found: {:?}", &open_sockets);
         open_sockets
     }
+
 
     /// Given a socket, scan it self.tries times.
     /// Turns the address into a SocketAddr
@@ -134,12 +137,12 @@ impl Scanner {
 
         for nr_try in 1..=tries {
             match self.connect(socket).await {
-                Ok(x) => {
+                Ok(mut x) => {
                     debug!(
                         "Connection was successful, shutting down stream {}",
                         &socket
                     );
-                    if let Err(e) = x.shutdown(Shutdown::Both) {
+                    if let Err(e) = x.shutdown().await {
                         debug!("Shutdown stream error {}", &e);
                     }
                     if !self.greppable {
@@ -184,11 +187,11 @@ impl Scanner {
     /// ```
     ///
     async fn connect(&self, socket: SocketAddr) -> io::Result<TcpStream> {
-        let stream = io::timeout(
+        let stream = tokio::time::timeout(
             self.timeout,
             async move { TcpStream::connect(socket).await },
         )
-        .await?;
+        .await??;
         Ok(stream)
     }
 }
